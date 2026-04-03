@@ -48,7 +48,7 @@ def planner_node(state: AgentState) -> AgentState:
     for refactoring the codebase.
     """
     from src.state.models import AgentState as StateModel, RefactoringStep, TaskStatus
-    from langchain_openai import ChatOpenAI
+    from langchain_groq import ChatGroq
     import os
     from dotenv import load_dotenv
     
@@ -56,9 +56,9 @@ def planner_node(state: AgentState) -> AgentState:
     
     logger.info(f"Planning refactoring task: {state['task_description']}")
     
-    # Initialize LLM
-    model_name = os.getenv("LLM_MODEL", "gpt-4o")
-    llm = ChatOpenAI(model=model_name, temperature=0)
+    # Initialize LLM with Groq
+    model_name = os.getenv("LLM_MODEL", "llama-3.1-70b-versatile")
+    llm = ChatGroq(model=model_name, temperature=0)
     
     # Create planning prompt
     system_prompt = """You are an expert software architect and refactoring specialist.
@@ -144,7 +144,7 @@ def executor_node(state: AgentState) -> AgentState:
     to modify the codebase.
     """
     from src.tools import read_file, write_file, run_linter, run_formatter, find_python_files
-    from langchain_openai import ChatOpenAI
+    from langchain_groq import ChatGroq
     import os
     from dotenv import load_dotenv
     
@@ -171,9 +171,9 @@ def executor_node(state: AgentState) -> AgentState:
             files_to_process = find_python_files(state['repo_path'])
             logger.info(f"Found {len(files_to_process)} Python files to process")
         
-        # Initialize LLM for code transformation
-        model_name = os.getenv("LLM_MODEL", "gpt-4o")
-        llm = ChatOpenAI(model=model_name, temperature=0.3)
+        # Initialize LLM for code transformation with Groq
+        model_name = os.getenv("LLM_MODEL", "llama-3.1-70b-versatile")
+        llm = ChatGroq(model=model_name, temperature=0.3)
         
         processed_count = 0
         for file_path in files_to_process:

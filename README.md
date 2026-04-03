@@ -15,7 +15,7 @@ An autonomous AI agent that connects to a GitHub repository, analyzes code for "
 Built with:
 - **Language**: Python 3.10+
 - **Agent Framework**: LangGraph (explicit state and cycle control)
-- **LLM Interface**: OpenAI API or Anthropic Claude
+- **LLM Interface**: Groq (Llama 3.1, Mixtral, Gemma)
 - **State Management**: Pydantic models for type-safe state tracking
 
 ## Installation
@@ -33,7 +33,7 @@ cp .env.example .env
 ```
 
 Required environment variables:
-- `OPENAI_API_KEY` or `ANTHROPIC_API_KEY`
+- `GROQ_API_KEY` (for Groq LLM access)
 - `GITHUB_TOKEN` (for PR creation)
 
 ## Usage
