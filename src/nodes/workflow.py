@@ -50,6 +50,7 @@ def planner_node(state: AgentState) -> AgentState:
     from src.state.models import AgentState as StateModel, RefactoringStep, TaskStatus
     from langchain_groq import ChatGroq
     import os
+    import json
     from dotenv import load_dotenv
     
     load_dotenv()
@@ -60,7 +61,7 @@ def planner_node(state: AgentState) -> AgentState:
     model_name = os.getenv("LLM_MODEL", "llama-3.1-70b-versatile")
     llm = ChatGroq(model=model_name, temperature=0)
     
-    # Create planning prompt
+    # Create planning prompt with explicit JSON output instruction
     system_prompt = """You are an expert software architect and refactoring specialist.
 Your task is to create a detailed, step-by-step plan for refactoring code.
 
@@ -71,50 +72,89 @@ Each step should:
 3. Include the type of refactoring action (add_type_hints, extract_method, rename_variable, etc.)
 4. Be ordered logically (dependencies first)
 
-Return your response as a JSON array of steps, where each step has:
+Return your response as a valid JSON array of steps ONLY. No markdown, no explanations.
+Each step must have:
 - step_id: integer
 - description: string
 - file_path: string or null
-- action: string (one of: add_type_hints, extract_method, rename_variable, simplify_logic, add_docstring, fix_imports, format_code)
+- action: string (one of: add_type_hints, extract_method, rename_variable, simplify_logic, add_docstring, fix_imports, format_code, analyze, refactor, verify)
+
+Example format:
+[{"step_id": 1, "description": "Analyze code", "file_path": null, "action": "analyze"}, {"step_id": 2, "description": "Add types", "file_path": "src/main.py", "action": "add_type_hints"}]
 """
     
     user_prompt = f"""Task: {state['task_description']}
 Repository: {state['repo_url']}
 Target files: {state['target_files'] or 'All Python files'}
 
-Create a detailed refactoring plan."""
+Create a detailed refactoring plan as a JSON array."""
     
     try:
         response = llm.invoke([
-            HumanMessage(content=system_prompt),
-            HumanMessage(content=user_prompt)
+            ("system", system_prompt),
+            ("human", user_prompt)
         ])
         
-        # Parse the response (in production, use structured output or JSON mode)
-        plan_text = response.content
+        # Parse the response - extract JSON from the content
+        plan_text = response.content.strip()
         
-        # For now, create a simple placeholder plan
-        # In production, you'd parse the LLM's JSON response
-        steps = [
-            {
-                "step_id": 1,
-                "description": f"Analyze codebase for {state['task_description']}",
-                "file_path": None,
-                "action": "analyze"
-            },
-            {
-                "step_id": 2,
-                "description": f"Apply refactoring: {state['task_description']}",
-                "file_path": None,
-                "action": "refactor"
-            },
-            {
-                "step_id": 3,
-                "description": "Run linters and formatters",
-                "file_path": None,
-                "action": "verify"
-            }
-        ]
+        # Remove markdown code blocks if present
+        if plan_text.startswith("```"):
+            lines = plan_text.split("\n")
+            # Find the first line that doesn't start with ```
+            start_idx = 0
+            for i, line in enumerate(lines):
+                if not line.startswith("```"):
+                    start_idx = i
+                    break
+            # Find the last line that doesn't start with ```
+            end_idx = len(lines)
+            for i in range(len(lines) - 1, -1, -1):
+                if not lines[i].startswith("```"):
+                    end_idx = i + 1
+                    break
+            plan_text = "\n".join(lines[start_idx:end_idx])
+        
+        # Try to parse the JSON response
+        steps = []
+        try:
+            parsed_steps = json.loads(plan_text)
+            if isinstance(parsed_steps, list):
+                # Validate and normalize the steps
+                for i, step in enumerate(parsed_steps):
+                    if isinstance(step, dict):
+                        validated_step = {
+                            "step_id": step.get("step_id", i + 1),
+                            "description": step.get("description", f"Step {i + 1}"),
+                            "file_path": step.get("file_path"),
+                            "action": step.get("action", "refactor")
+                        }
+                        steps.append(validated_step)
+        except json.JSONDecodeError:
+            logger.warning(f"Failed to parse LLM response as JSON, using fallback plan")
+        
+        # If parsing failed or returned empty, create a sensible default plan
+        if not steps:
+            steps = [
+                {
+                    "step_id": 1,
+                    "description": f"Analyze codebase for {state['task_description']}",
+                    "file_path": None,
+                    "action": "analyze"
+                },
+                {
+                    "step_id": 2,
+                    "description": f"Apply refactoring: {state['task_description']}",
+                    "file_path": None,
+                    "action": "refactor"
+                },
+                {
+                    "step_id": 3,
+                    "description": "Run linters and formatters",
+                    "file_path": None,
+                    "action": "verify"
+                }
+            ]
         
         logger.info(f"Created plan with {len(steps)} steps")
         
@@ -141,7 +181,8 @@ def executor_node(state: AgentState) -> AgentState:
     """Executor node that applies refactoring changes.
     
     This node executes the current step in the plan by calling appropriate tools
-    to modify the codebase.
+    to modify the codebase. It also handles self-correction when verification
+    errors are passed back from the verifier node.
     """
     from src.tools import read_file, write_file, run_linter, run_formatter, find_python_files
     from langchain_groq import ChatGroq
@@ -175,9 +216,14 @@ def executor_node(state: AgentState) -> AgentState:
         model_name = os.getenv("LLM_MODEL", "llama-3.1-70b-versatile")
         llm = ChatGroq(model=model_name, temperature=0.3)
         
+        # Check if we're in a retry loop due to verification failures
+        linter_errors = state.get('linter_errors', [])
+        test_failures = state.get('test_failures', [])
+        has_verification_errors = len(linter_errors) > 0 or len(test_failures) > 0
+        
         processed_count = 0
         for file_path in files_to_process:
-            if file_path in state['processed_files']:
+            if file_path in state['processed_files'] and not has_verification_errors:
                 continue
                 
             logger.info(f"Processing file: {file_path}")
@@ -190,25 +236,36 @@ def executor_node(state: AgentState) -> AgentState:
             
             original_content = result.output
             
-            # Create refactoring prompt
+            # Create refactoring prompt - include error context if available
             system_prompt = """You are an expert Python developer. Your task is to refactor code according to the given instructions.
 Return ONLY the refactored code, no explanations or markdown."""
             
             action = current_step.get('action', 'refactor')
             task = state['task_description']
             
+            # Build user prompt with optional error context for self-correction
             user_prompt = f"""Original code:
 {original_content}
 
 Task: {task}
 Specific action: {action}
-
-Refactor the code accordingly. Return only the complete refactored code."""
+"""
+            
+            # Add error context if we're in a retry loop
+            if has_verification_errors:
+                # Find errors specific to this file
+                file_errors = [err for err in linter_errors if file_path in err]
+                if file_errors:
+                    user_prompt += f"\nIMPORTANT: The previous version had these linter errors that MUST be fixed:\n"
+                    user_prompt += "\n".join(file_errors[:5])
+                    user_prompt += "\n\nFix these errors while applying the refactoring."
+            
+            user_prompt += "\nRefactor the code accordingly. Return only the complete refactored code."
             
             try:
                 response = llm.invoke([
-                    HumanMessage(content=system_prompt),
-                    HumanMessage(content=user_prompt)
+                    ("system", system_prompt),
+                    ("human", user_prompt)
                 ])
                 
                 refactored_content = response.content.strip()
@@ -223,13 +280,15 @@ Refactor the code accordingly. Return only the complete refactored code."""
                 write_result = write_file(file_path, refactored_content)
                 if write_result.success:
                     processed_count += 1
-                    state['processed_files'].append(file_path)
+                    if file_path not in state['processed_files']:
+                        state['processed_files'].append(file_path)
                     
                     state['execution_history'].append({
                         "step_id": current_step['step_id'],
                         "file_path": file_path,
                         "action": action,
-                        "success": True
+                        "success": True,
+                        "was_retry": has_verification_errors
                     })
                 else:
                     logger.error(f"Failed to write {file_path}: {write_result.error}")
@@ -273,6 +332,7 @@ def verifier_node(state: AgentState) -> AgentState:
     If issues are found, it can loop back to the executor for fixes.
     """
     from src.tools import run_linter, run_formatter, run_tests, find_python_files
+    from langchain_core.messages import AIMessage
     import os
     
     logger.info("Running verification checks")
@@ -284,13 +344,13 @@ def verifier_node(state: AgentState) -> AgentState:
         linter_errors = []
         
         # Run ruff on each file
-        for file_path in python_files[-5:]:  # Limit to first 5 files for demo
+        for file_path in python_files[:5]:  # Limit to first 5 files for demo
             result = run_linter(file_path, "ruff")
             if not result.success:
                 linter_errors.append(f"{file_path}: {result.output}")
         
         # Run black check
-        for file_path in python_files[-3:]:  # Limit for demo
+        for file_path in python_files[:3]:  # Limit for demo
             result = run_linter(file_path, "black")
             if not result.success:
                 linter_errors.append(f"{file_path}: {result.output}")
@@ -307,7 +367,7 @@ def verifier_node(state: AgentState) -> AgentState:
         has_issues = len(linter_errors) > 0 or len(test_failures) > 0
         
         if has_issues:
-            # Add verification feedback to execution history
+            # Add verification feedback to execution history with error details for self-correction
             state['execution_history'].append({
                 "type": "verification",
                 "linter_errors": linter_errors[:5],  # Limit errors stored
@@ -320,7 +380,8 @@ def verifier_node(state: AgentState) -> AgentState:
                 "linter_errors": linter_errors,
                 "test_failures": test_failures,
                 "overall_status": "verification_failed",
-                "messages": state["messages"] + [AIMessage(content=f"Verification found {len(linter_errors)} linter issues and {len(test_failures)} test failures")]
+                "should_continue": True,  # Explicitly continue to allow retry
+                "messages": state["messages"] + [AIMessage(content=f"Verification found {len(linter_errors)} linter issues and {len(test_failures)} test failures. Errors: {linter_errors[:3]}")]
             }
         else:
             return {
@@ -328,6 +389,7 @@ def verifier_node(state: AgentState) -> AgentState:
                 "linter_errors": [],
                 "test_failures": [],
                 "overall_status": "verified",
+                "should_continue": True,
                 "messages": state["messages"] + [AIMessage(content="Verification passed successfully")]
             }
         

@@ -95,9 +95,9 @@ def main(repo_url: str, task_description: str, target_files: str,
         load_dotenv()
         
         # Validate environment
-        api_key = os.getenv("OPENAI_API_KEY") or os.getenv("ANTHROPIC_API_KEY")
+        api_key = os.getenv("GROQ_API_KEY")
         if not api_key and not dry_run:
-            console.print("[red]Error:[/red] No API key found. Set OPENAI_API_KEY or ANTHROPIC_API_KEY in your .env file.")
+            console.print("[red]Error:[/red] No API key found. Set GROQ_API_KEY in your .env file.")
             sys.exit(1)
         
         # Parse target files
