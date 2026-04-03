@@ -217,7 +217,7 @@ def create_git_branch(branch_name: str, cwd: str) -> ToolResult:
         ToolResult indicating success or failure
     """
     # First ensure we're on main/master
-    result = run_command("git checkout -b {branch_name}", cwd=cwd)
+    result = run_command(f"git checkout -b {branch_name}", cwd=cwd)
     if not result.success:
         return result
     

@@ -1,44 +1,72 @@
 ```
-# Environment variables
-.env
-.env.local
-.env.*
-
-# Dependencies
-venv/
-.venv/
+# Python
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
-
-# Build artifacts
-build/
-dist/
-*.egg-info/
-
-# Logs
+.Python
+env/
+venv/
+.venv/
+.ENV
+.venv.bak/
+pip-log.txt
+pip-delete-this-directory.txt
+.tox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
 *.log
+*.pot
+*.po
+*~
+.pytest_cache/
+.mypy_cache/
+.hypothesis/
 
-# Editor/IDE
+# Distribution / packaging
+.Python
+_build/
+buck-out/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# IDEs
 .vscode/
 .idea/
 *.swp
 *.swo
-*.tmp
 
-# OS
+# Environment
+.env
+.env.local
+.env.*
+
+# OS generated files
 .DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
 Thumbs.db
-
-# Coverage
-.coverage
-coverage/
-htmlcov/
-
-# Python specific
-*.py[cod]
-*$py.class
-*.so
-.Python
+Thumbs.db:encryptable
 ```
