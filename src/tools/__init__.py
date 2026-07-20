@@ -34,6 +34,12 @@ from .sandbox import (
     SandboxResult,
     SandboxUnavailableError,
 )
+from .patch_tools import (
+    apply_patch,
+    diff_targets_path,
+    has_hunks,
+)
+from .run_log import write_run_log
 
 __all__ = [
     # File operations
@@ -67,4 +73,10 @@ __all__ = [
     "run_in_sandbox",
     "SandboxResult",
     "SandboxUnavailableError",
+    # Patch / diff editing
+    "apply_patch",
+    "diff_targets_path",
+    "has_hunks",
+    # Run log
+    "write_run_log",
 ]

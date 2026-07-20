@@ -69,4 +69,6 @@ MANIFEST
 ehthumbs.db
 Thumbs.db
 Thumbs.db:encryptable
+
+commit-msg.txt
 ```

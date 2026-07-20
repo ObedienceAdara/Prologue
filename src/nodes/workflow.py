@@ -1,24 +1,33 @@
 """LangGraph nodes for the Codebase Refactor Agent.
 
-Security-relevant changes from the original implementation
-------------------------------------------------------------
-1. The graph no longer auto-commits, pushes, and opens a PR the moment
-   verification passes. `verifier_node`'s success path ends the graph in an
-   `"awaiting_approval"` state. `github_integration_node` still exists and
-   does the same job as before, but it is now called *directly by the CLI*,
-   only after the operator has reviewed a diff and explicitly approved it
-   (or passed `--yes`). See main.py.
-2. `executor_node` validates that any file it's about to touch stays inside
-   the cloned repository (no path traversal), and syntax-checks Python
-   output with `ast.parse` before writing it - if the model's response
-   isn't valid Python, the file is left untouched and the failure is
-   recorded, instead of silently corrupting the file on disk.
-3. `verifier_node` runs linting/formatting/tests through the sandbox
-   (src/tools/sandbox.py) by default, since those commands execute code
-   that lives inside the untrusted cloned repository. It also removes the
-   original "first 5 / first 3 files, for demo" shortcut, and bounds the
-   executor<->verifier retry loop via `max_retries` (which existed as an
-   unused field in the Pydantic model before, but was never wired up).
+Changes in this pass
+---------------------
+1. **Single state model.** The graph now runs on `AgentState` from
+   src/state/models.py (a Pydantic model) instead of a separate, divergent
+   `TypedDict` defined here. Node functions read state via attribute access
+   (`state.repo_path`) and return plain dicts of the fields they changed -
+   LangGraph merges those into a new state instance, using the
+   `operator.add` reducers declared on `messages` and `execution_history`
+   to *append* rather than replace for those two fields specifically.
+
+2. **Diff-based editing.** `executor_node` now asks the LLM for a unified
+   diff instead of a full file rewrite, and applies it via
+   `src/tools/patch_tools.apply_patch` (`git apply`). This is cheaper
+   (smaller prompts/responses), safer (a patch that doesn't cleanly apply
+   is rejected before anything is written), and gives a real rollback path:
+   if a patch applies but leaves invalid Python, the file is restored to
+   its pre-patch content rather than left corrupted.
+
+3. **Cost tracking.** `llm_calls_used` counts every LLM invocation across
+   planning and execution (including retries), surfaced in the CLI summary
+   and the run log. `estimate_llm_calls` gives an upfront estimate before
+   any calls are made, for --max-files / cost-confirmation purposes.
+
+4. **Optional checkpointing.** `build_refactor_graph` accepts a
+   `checkpointer` (e.g. a LangGraph SQLite checkpointer) so a run can be
+   resumed by thread_id after a crash. This is layered on top of - not a
+   replacement for - the run log written by main.py, which is a plain
+   human-readable record independent of whether checkpointing is enabled.
 """
 
 from __future__ import annotations
@@ -26,67 +35,26 @@ from __future__ import annotations
 import ast
 import logging
 import re
-from typing import TypedDict, Annotated, Sequence
+from typing import Any, Dict, Optional
 
 from langgraph.graph import StateGraph, END
-from langchain_core.messages import BaseMessage, AIMessage
+from langchain_core.messages import AIMessage
+
+from src.state.models import AgentState
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_LLM_MODEL = "openai/gpt-oss-120b"
 _CODE_FENCE_RE = re.compile(r"```(?:python)?\s*\n(.*?)```", re.DOTALL)
-
-
-class AgentState(TypedDict):
-    """State for the LangGraph workflow."""
-
-    messages: Annotated[Sequence[BaseMessage], lambda x, y: x + y]
-    repo_url: str
-    repo_path: str
-    task_description: str
-    target_files: list[str] | None
-    branch_name: str
-
-    # Planning
-    plan: list[dict]
-    current_step_index: int
-
-    # Execution tracking
-    processed_files: list[str]
-    execution_history: list[dict]
-
-    # Verification results
-    linter_errors: list[str]
-    test_failures: list[str]
-    retry_count: int
-    max_retries: int
-    sandbox_enabled: bool
-
-    # GitHub integration (populated only after human approval, see main.py)
-    pr_title: str | None
-    pr_description: str | None
-    pr_url: str | None
-
-    # Overall status
-    overall_status: str
-    error_message: str | None
-    should_continue: bool
+_DIFF_FENCE_RE = re.compile(r"```(?:diff|patch)?\s*\n(.*?)```", re.DOTALL)
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _extract_code(llm_text: str) -> str | None:
-    """Pull code out of an LLM response, handling the common formatting cases.
-
-    The original implementation only stripped fences when the response
-    *started* with ``` - if the model prefaced its answer with any
-    commentary ("Here's the refactored code:"), that commentary got written
-    into the file verbatim. This checks for a fenced block anywhere in the
-    response first, and falls back to the raw (stripped) text only if no
-    fence is found at all.
-    """
+def _extract_code(llm_text: str) -> Optional[str]:
+    """Pull code out of an LLM response, handling the common formatting cases."""
     if not llm_text:
         return None
 
@@ -97,13 +65,36 @@ def _extract_code(llm_text: str) -> str | None:
         return match.group(1).strip()
 
     if text.startswith("```") or text.endswith("```"):
-        # Malformed / partial fence - don't guess, treat as unusable.
         return None
 
     return text if text else None
 
 
-def _validate_python_syntax(content: str) -> str | None:
+def _extract_diff(llm_text: str) -> Optional[str]:
+    """Pull a unified diff out of an LLM response.
+
+    Handles: a fenced ```diff / ```patch / plain ``` block anywhere in the
+    response (preferred), or - if there's no fence at all - the raw
+    (stripped) text, on the assumption the model followed the "diff only,
+    no commentary" instruction. A malformed/partial fence is treated as
+    unusable rather than guessed at.
+    """
+    if not llm_text:
+        return None
+
+    text = llm_text.strip()
+
+    match = _DIFF_FENCE_RE.search(text)
+    if match:
+        return match.group(1).strip()
+
+    if text.startswith("```") or text.endswith("```"):
+        return None
+
+    return text if text else None
+
+
+def _validate_python_syntax(content: str) -> Optional[str]:
     """Return an error message if `content` isn't valid Python, else None."""
     try:
         ast.parse(content)
@@ -117,11 +108,23 @@ def _get_llm(model_name: str, temperature: float):
     return ChatGroq(model=model_name, temperature=temperature)
 
 
+def estimate_llm_calls(num_files: int, max_retries: int) -> int:
+    """Upper-bound estimate of LLM calls for a run: one planning call, plus
+    each file processed up to (1 + max_retries) times in the worst case
+    (an initial attempt plus one attempt per retry cycle)."""
+    return 1 + num_files * (1 + max_retries)
+
+
+def _relpath(file_path: str, repo_path: str) -> str:
+    from pathlib import Path
+    return str(Path(file_path).resolve().relative_to(Path(repo_path).resolve()))
+
+
 # ---------------------------------------------------------------------------
 # Nodes
 # ---------------------------------------------------------------------------
 
-def planner_node(state: AgentState) -> AgentState:
+def planner_node(state: AgentState) -> Dict[str, Any]:
     """Planner node that breaks down the refactoring task into steps."""
     import os
     import json
@@ -129,7 +132,7 @@ def planner_node(state: AgentState) -> AgentState:
 
     load_dotenv()
 
-    logger.info(f"Planning refactoring task: {state['task_description']}")
+    logger.info(f"Planning refactoring task: {state.task_description}")
 
     model_name = os.getenv("LLM_MODEL", DEFAULT_LLM_MODEL)
     llm = _get_llm(model_name, temperature=0)
@@ -155,11 +158,13 @@ Example format:
 [{"step_id": 1, "description": "Analyze code", "file_path": null, "action": "analyze"}, {"step_id": 2, "description": "Add types", "file_path": "src/main.py", "action": "add_type_hints"}]
 """
 
-    user_prompt = f"""Task: {state['task_description']}
-Repository: {state['repo_url']}
-Target files: {state['target_files'] or 'All Python files'}
+    user_prompt = f"""Task: {state.task_description}
+Repository: {state.repo_url}
+Target files: {state.target_files or 'All Python files'}
 
 Create a detailed refactoring plan as a JSON array."""
+
+    llm_calls = state.llm_calls_used + 1
 
     try:
         response = llm.invoke([
@@ -200,59 +205,60 @@ Create a detailed refactoring plan as a JSON array."""
 
         if not steps:
             steps = [
-                {"step_id": 1, "description": f"Analyze codebase for {state['task_description']}", "file_path": None, "action": "analyze"},
-                {"step_id": 2, "description": f"Apply refactoring: {state['task_description']}", "file_path": None, "action": "refactor"},
+                {"step_id": 1, "description": f"Analyze codebase for {state.task_description}", "file_path": None, "action": "analyze"},
+                {"step_id": 2, "description": f"Apply refactoring: {state.task_description}", "file_path": None, "action": "refactor"},
                 {"step_id": 3, "description": "Run linters and formatters", "file_path": None, "action": "verify"},
             ]
 
         logger.info(f"Created plan with {len(steps)} steps")
 
         return {
-            **state,
             "plan": steps,
             "current_step_index": 0,
             "overall_status": "in_progress",
-            "messages": state["messages"] + [AIMessage(content=f"Created refactoring plan with {len(steps)} steps")]
+            "llm_calls_used": llm_calls,
+            "messages": [AIMessage(content=f"Created refactoring plan with {len(steps)} steps")],
         }
 
     except Exception as e:
         logger.error(f"Planning failed: {e}")
         return {
-            **state,
             "overall_status": "failed",
             "error_message": str(e),
             "should_continue": False,
-            "messages": state["messages"] + [AIMessage(content=f"Planning failed: {str(e)}")]
+            "llm_calls_used": llm_calls,
+            "messages": [AIMessage(content=f"Planning failed: {str(e)}")],
         }
 
 
-def executor_node(state: AgentState) -> AgentState:
-    """Executor node that applies refactoring changes.
+def executor_node(state: AgentState) -> Dict[str, Any]:
+    """Executor node that applies refactoring changes via diff/patch application.
 
-    Every write is guarded by two checks that didn't exist before:
-      * the target path must resolve inside the cloned repo (no traversal)
-      * for .py files, the LLM's output must parse as valid Python before
-        it's written - if it doesn't, the original file is left alone.
+    Per file: request a unified diff from the LLM, validate it targets the
+    expected path, apply it with `git apply`, then syntax-check the result
+    (.py files) and roll back to the pre-patch content if that check fails.
+    Nothing is left half-written: either the patch is fully applied and
+    valid, or the file is exactly as it was before this attempt.
     """
-    from src.tools import read_file, write_file, find_python_files, is_safe_relpath
+    from src.tools import read_file, write_file, find_python_files, is_safe_relpath, apply_patch
     import os
     from dotenv import load_dotenv
 
     load_dotenv()
 
-    logger.info(f"Executing step {state['current_step_index'] + 1}/{len(state['plan'])}")
+    logger.info(f"Executing step {state.current_step_index + 1}/{len(state.plan)}")
 
-    if state['current_step_index'] >= len(state['plan']):
+    if state.current_step_index >= len(state.plan):
         logger.info("All steps completed")
-        return {
-            **state,
-            "messages": state["messages"] + [AIMessage(content="All execution steps completed")]
-        }
+        return {"messages": [AIMessage(content="All execution steps completed")]}
 
-    current_step = state['plan'][state['current_step_index']]
+    current_step = state.plan[state.current_step_index]
     logger.info(f"Executing step: {current_step['description']}")
 
-    repo_path = state['repo_path']
+    repo_path = state.repo_path
+    new_history = []
+    new_processed = list(state.processed_files)
+    llm_calls_made = 0
 
     try:
         if current_step.get('file_path'):
@@ -261,24 +267,32 @@ def executor_node(state: AgentState) -> AgentState:
             files_to_process = find_python_files(repo_path)
             logger.info(f"Found {len(files_to_process)} Python files to process")
 
+        if state.max_files and len(files_to_process) > state.max_files:
+            logger.warning(
+                f"Capping this step to the first {state.max_files} of {len(files_to_process)} files (--max-files)."
+            )
+            files_to_process = files_to_process[: state.max_files]
+
         model_name = os.getenv("LLM_MODEL", DEFAULT_LLM_MODEL)
         llm = _get_llm(model_name, temperature=0.3)
 
-        linter_errors = state.get('linter_errors', [])
-        test_failures = state.get('test_failures', [])
+        linter_errors = state.linter_errors
+        test_failures = state.test_failures
         has_verification_errors = len(linter_errors) > 0 or len(test_failures) > 0
 
         processed_count = 0
         for file_path in files_to_process:
-            if file_path in state['processed_files'] and not has_verification_errors:
+            if file_path in new_processed and not has_verification_errors:
                 continue
+
+            action = current_step.get('action', 'refactor')
 
             if not is_safe_relpath(repo_path, file_path):
                 logger.warning(f"Skipping path outside repo root: {file_path}")
-                state['execution_history'].append({
+                new_history.append({
                     "step_id": current_step['step_id'],
                     "file_path": file_path,
-                    "action": current_step.get('action', 'refactor'),
+                    "action": action,
                     "success": False,
                     "error": "Path resolves outside the repository root; refused.",
                 })
@@ -292,14 +306,23 @@ def executor_node(state: AgentState) -> AgentState:
                 continue
 
             original_content = result.output
+            relative_path = _relpath(file_path, repo_path)
 
-            system_prompt = """You are an expert Python developer. Your task is to refactor code according to the given instructions.
-Return ONLY the refactored code, no explanations or markdown."""
+            system_prompt = """You are an expert Python developer. Given a file's content and a \
+refactoring task, produce a single unified diff that applies the requested change.
 
-            action = current_step.get('action', 'refactor')
-            task = state['task_description']
+Rules:
+- Output ONLY a unified diff - no explanation, no markdown fences, no commentary.
+- Use file headers exactly as: "--- a/<path>" and "+++ b/<path>" with the path given to you.
+- Include at least 3 lines of context around every change.
+- Do not touch lines unrelated to the requested change.
+- If no change is actually needed, output an empty response (no diff at all)."""
 
-            user_prompt = f"""Original code:
+            task = state.task_description
+
+            user_prompt = f"""File path: {relative_path}
+
+Original content:
 {original_content}
 
 Task: {task}
@@ -311,104 +334,117 @@ Specific action: {action}
                 if file_errors:
                     user_prompt += "\nIMPORTANT: The previous version had these linter errors that MUST be fixed:\n"
                     user_prompt += "\n".join(file_errors[:5])
-                    user_prompt += "\n\nFix these errors while applying the refactoring."
+                    user_prompt += "\n\nFix these errors as part of the diff."
 
-            user_prompt += "\nRefactor the code accordingly. Return only the complete refactored code."
+            user_prompt += "\nReturn only the unified diff."
 
             try:
                 response = llm.invoke([
                     ("system", system_prompt),
                     ("human", user_prompt)
                 ])
+                llm_calls_made += 1
 
-                refactored_content = _extract_code(response.content)
+                diff_text = _extract_diff(response.content)
 
-                if not refactored_content:
-                    logger.warning(f"Model returned no usable code for {file_path}; leaving file unchanged")
-                    state['execution_history'].append({
-                        "step_id": current_step['step_id'],
-                        "file_path": file_path,
-                        "action": action,
-                        "success": False,
-                        "error": "Model response contained no extractable code; file left unchanged.",
-                    })
-                    continue
-
-                if file_path.endswith(".py"):
-                    syntax_error = _validate_python_syntax(refactored_content)
-                    if syntax_error:
-                        logger.error(f"Refusing to write invalid Python to {file_path}: {syntax_error}")
-                        state['execution_history'].append({
-                            "step_id": current_step['step_id'],
-                            "file_path": file_path,
-                            "action": action,
-                            "success": False,
-                            "error": f"Generated content failed syntax check, file left unchanged: {syntax_error}",
-                        })
-                        continue
-
-                write_result = write_file(file_path, refactored_content)
-                if write_result.success:
-                    processed_count += 1
-                    if file_path not in state['processed_files']:
-                        state['processed_files'].append(file_path)
-
-                    state['execution_history'].append({
+                if not diff_text:
+                    new_history.append({
                         "step_id": current_step['step_id'],
                         "file_path": file_path,
                         "action": action,
                         "success": True,
-                        "was_retry": has_verification_errors
+                        "note": "No diff produced (no change needed or nothing extractable); file left unchanged.",
                     })
-                else:
-                    logger.error(f"Failed to write {file_path}: {write_result.error}")
+                    continue
+
+                patch_result = apply_patch(repo_path, relative_path, diff_text)
+                if not patch_result.success:
+                    logger.warning(f"Patch did not apply for {file_path}: {patch_result.error}")
+                    new_history.append({
+                        "step_id": current_step['step_id'],
+                        "file_path": file_path,
+                        "action": action,
+                        "success": False,
+                        "error": f"Patch not applied: {patch_result.error}",
+                    })
+                    continue
+
+                if file_path.endswith(".py"):
+                    post_patch = read_file(file_path)
+                    syntax_error = _validate_python_syntax(post_patch.output) if post_patch.success else "could not re-read file"
+                    if syntax_error:
+                        logger.error(f"Patch applied but produced invalid syntax in {file_path}; reverting: {syntax_error}")
+                        write_file(file_path, original_content)
+                        new_history.append({
+                            "step_id": current_step['step_id'],
+                            "file_path": file_path,
+                            "action": action,
+                            "success": False,
+                            "error": f"Patch applied but produced invalid syntax; reverted. {syntax_error}",
+                        })
+                        continue
+
+                processed_count += 1
+                if file_path not in new_processed:
+                    new_processed.append(file_path)
+
+                new_history.append({
+                    "step_id": current_step['step_id'],
+                    "file_path": file_path,
+                    "action": action,
+                    "success": True,
+                    "was_retry": has_verification_errors,
+                })
 
             except Exception as e:
                 logger.error(f"Error refactoring {file_path}: {e}")
-                state['execution_history'].append({
+                new_history.append({
                     "step_id": current_step['step_id'],
                     "file_path": file_path,
                     "action": action,
                     "success": False,
-                    "error": str(e)
+                    "error": str(e),
                 })
 
         logger.info(f"Processed {processed_count} files in this step")
 
-        next_index = state['current_step_index'] + 1
+        next_index = state.current_step_index + 1
 
         return {
-            **state,
             "current_step_index": next_index,
-            "messages": state["messages"] + [AIMessage(content=f"Executed step {current_step['step_id']}: {current_step['description']}")]
+            "processed_files": new_processed,
+            "execution_history": new_history,
+            "llm_calls_used": state.llm_calls_used + llm_calls_made,
+            "messages": [AIMessage(content=f"Executed step {current_step['step_id']}: {current_step['description']}")],
         }
 
     except Exception as e:
         logger.error(f"Execution failed: {e}")
         return {
-            **state,
             "overall_status": "failed",
             "error_message": str(e),
             "should_continue": False,
-            "messages": state["messages"] + [AIMessage(content=f"Execution failed: {str(e)}")]
+            "execution_history": new_history,
+            "llm_calls_used": state.llm_calls_used + llm_calls_made,
+            "messages": [AIMessage(content=f"Execution failed: {str(e)}")],
         }
 
 
-def verifier_node(state: AgentState) -> AgentState:
+def verifier_node(state: AgentState) -> Dict[str, Any]:
     """Verifier node that runs linters and tests, sandboxed by default.
 
-    Also owns the retry-loop bound: each time issues are found, retry_count
-    is incremented; once it reaches max_retries, the workflow ends with a
-    "failed" status instead of looping indefinitely.
+    Owns the retry-loop bound: each time issues are found, retry_count is
+    incremented; once it exceeds max_retries, the workflow ends "failed"
+    instead of looping indefinitely.
     """
     from src.tools import run_linter, run_tests, find_python_files, is_docker_available
 
     logger.info("Running verification checks")
 
-    repo_path = state['repo_path']
-    sandbox_enabled = state.get('sandbox_enabled', True)
-    max_retries = state.get('max_retries', 3)
-    retry_count = state.get('retry_count', 0)
+    repo_path = state.repo_path
+    sandbox_enabled = state.sandbox_enabled
+    max_retries = state.max_retries
+    retry_count = state.retry_count
 
     if sandbox_enabled and not is_docker_available():
         message = (
@@ -419,18 +455,16 @@ def verifier_node(state: AgentState) -> AgentState:
         )
         logger.error(message)
         return {
-            **state,
             "overall_status": "failed",
             "error_message": message,
             "should_continue": False,
-            "messages": state["messages"] + [AIMessage(content=message)]
+            "messages": [AIMessage(content=message)],
         }
 
     try:
         python_files = find_python_files(repo_path)
 
-        linter_errors: list[str] = []
-
+        linter_errors = []
         for file_path in python_files:
             result = run_linter(file_path, "ruff", repo_root=repo_path, use_sandbox=sandbox_enabled)
             if not result.success:
@@ -441,7 +475,7 @@ def verifier_node(state: AgentState) -> AgentState:
             if not result.success:
                 linter_errors.append(f"{file_path}: {result.output or result.error}")
 
-        test_failures: list[str] = []
+        test_failures = []
         test_result = run_tests(".", cwd=repo_path, use_sandbox=sandbox_enabled)
         if not test_result.success:
             test_failures.append((test_result.output or test_result.error or "")[:1000])
@@ -453,13 +487,14 @@ def verifier_node(state: AgentState) -> AgentState:
         if has_issues:
             new_retry_count = retry_count + 1
 
-            state['execution_history'].append({
+            verification_entry = [{
                 "type": "verification",
                 "linter_errors": linter_errors[:5],
                 "test_failures": test_failures[:3],
                 "requires_fix": True,
                 "retry_count": new_retry_count,
-            })
+                "success": False,
+            }]
 
             if new_retry_count > max_retries:
                 message = (
@@ -469,60 +504,61 @@ def verifier_node(state: AgentState) -> AgentState:
                 )
                 logger.error(message)
                 return {
-                    **state,
                     "linter_errors": linter_errors,
                     "test_failures": test_failures,
                     "retry_count": new_retry_count,
                     "overall_status": "failed",
                     "error_message": message,
                     "should_continue": False,
-                    "messages": state["messages"] + [AIMessage(content=message)]
+                    "execution_history": verification_entry,
+                    "messages": [AIMessage(content=message)],
                 }
 
             return {
-                **state,
                 "linter_errors": linter_errors,
                 "test_failures": test_failures,
                 "retry_count": new_retry_count,
                 "overall_status": "verification_failed",
                 "should_continue": True,
-                "messages": state["messages"] + [AIMessage(
+                "execution_history": verification_entry,
+                "messages": [AIMessage(
                     content=f"Verification found {len(linter_errors)} linter issues and {len(test_failures)} "
                             f"test failures (retry {new_retry_count}/{max_retries}). Errors: {linter_errors[:3]}"
-                )]
+                )],
             }
         else:
             return {
-                **state,
                 "linter_errors": [],
                 "test_failures": [],
                 "overall_status": "awaiting_approval",
                 "should_continue": True,
-                "messages": state["messages"] + [AIMessage(content="Verification passed. Changes are ready for review.")]
+                "messages": [AIMessage(content="Verification passed. Changes are ready for review.")],
             }
 
     except Exception as e:
         logger.error(f"Verification failed: {e}")
         return {
-            **state,
             "overall_status": "failed",
             "error_message": str(e),
             "should_continue": False,
-            "messages": state["messages"] + [AIMessage(content=f"Verification failed: {str(e)}")]
+            "messages": [AIMessage(content=f"Verification failed: {str(e)}")],
         }
 
 
-def github_integration_node(state: AgentState, github_token: str | None = None) -> AgentState:
+def github_integration_node(state, github_token: Optional[str] = None) -> Dict[str, Any]:
     """Create a branch, commit, push, and open a PR.
 
-    This is *not* wired into the automatic graph flow anymore - it's called
-    directly by the CLI, and only after the operator has reviewed a diff of
-    the working tree and explicitly approved it (see main.py). This is the
-    fix for "blind auto-commit/push/PR": the agent no longer ships changes
-    nobody has looked at.
+    Not wired into the automatic graph flow - called directly by the CLI,
+    only after the operator has reviewed a diff and explicitly approved it
+    (see main.py).
 
     Args:
-        state: Current agent state (must have passed verification).
+        state: Current agent state. Accepted as either a plain dict or an
+            `AgentState` instance and normalized to a dict internally,
+            since LangGraph's exact return representation for
+            Pydantic-schema graphs can vary by version (see
+            src/state/models.py's version note) and this function is also
+            called directly, outside the graph.
         github_token: GitHub token, passed explicitly rather than read from
             the environment here, so callers control exactly when/whether
             it's used and it's easier to keep out of logs.
@@ -530,19 +566,21 @@ def github_integration_node(state: AgentState, github_token: str | None = None) 
     from src.tools import create_git_branch, commit_changes, push_branch, create_pull_request, run_command, redact_secrets, is_valid_branch_name
     from datetime import datetime
 
+    state = state if isinstance(state, dict) else state.model_dump()
+
     logger.info("Starting GitHub integration")
 
     repo_path = state['repo_path']
     branch_name = state['branch_name']
     token = github_token
 
-    def _err(message: str) -> AgentState:
+    def _err(message: str) -> Dict[str, Any]:
         safe_message = redact_secrets(message, [token] if token else [])
         return {
             **state,
             "overall_status": "failed",
             "error_message": safe_message,
-            "messages": state["messages"] + [AIMessage(content=safe_message)]
+            "messages": state["messages"] + [AIMessage(content=safe_message)],
         }
 
     if not is_valid_branch_name(branch_name):
@@ -575,14 +613,15 @@ def github_integration_node(state: AgentState, github_token: str | None = None) 
         pr_description = f"""## Automated Refactoring
 
 This PR was created automatically by the Codebase Refactor Agent, and was
-reviewed and approved by a human operator before being pushed.
+reviewed and approved by a human operator before being pushed. Changes were
+applied as diffs/patches, not whole-file rewrites.
 
 ### Task
 {state['task_description']}
 
 ### Changes
 - Processed {len(processed_files)} files
-- Applied automated refactoring based on best practices
+- {state.get('llm_calls_used', 0)} LLM calls used this run
 
 ### Files Modified
 {chr(10).join(f'- `{f}`' for f in processed_files[:20])}
@@ -613,17 +652,15 @@ reviewed and approved by a human operator before being pushed.
                     "pr_description": pr_description,
                     "pr_url": pr_url,
                     "overall_status": "completed",
-                    "messages": state["messages"] + [AIMessage(content=f"Pull request created: {pr_url}")]
+                    "messages": state["messages"] + [AIMessage(content=f"Pull request created: {pr_url}")],
                 }
             else:
                 safe_msg = redact_secrets(pr_msg, [token])
                 return {
                     **state,
-                    # Distinct from "completed": the push succeeded but the PR
-                    # did not, so this shouldn't read as fully successful.
                     "overall_status": "completed_no_pr",
                     "error_message": safe_msg,
-                    "messages": state["messages"] + [AIMessage(content=f"Pushed branch, but PR creation failed: {safe_msg}")]
+                    "messages": state["messages"] + [AIMessage(content=f"Pushed branch, but PR creation failed: {safe_msg}")],
                 }
         else:
             return {
@@ -632,33 +669,27 @@ reviewed and approved by a human operator before being pushed.
                 "pr_description": pr_description,
                 "overall_status": "completed_no_pr",
                 "error_message": "No GitHub token provided, skipping PR creation",
-                "messages": state["messages"] + [AIMessage(content="Changes committed and pushed. No GitHub token provided, skipping PR creation.")]
+                "messages": state["messages"] + [AIMessage(content="Changes committed and pushed. No GitHub token provided, skipping PR creation.")],
             }
 
     except Exception as e:
         return _err(f"GitHub integration failed: {str(e)}")
 
 
-def should_continue(state: AgentState) -> str:
-    """Conditional edge to determine if workflow should continue."""
-    if state.get('should_continue') is False:
-        return "end"
-    if state.get('overall_status') == 'failed':
-        return "end"
-    if state.get('overall_status') in ('completed', 'completed_no_pr'):
-        return "end"
-    return "continue"
-
-
-def build_refactor_graph():
+def build_refactor_graph(checkpointer=None):
     """Build the LangGraph workflow for codebase refactoring.
+
+    Args:
+        checkpointer: Optional LangGraph checkpointer (e.g. a SQLite
+            checkpointer) enabling a run to be resumed by thread_id after a
+            crash. See main.py's `--resume` flag. If omitted, the graph
+            still works exactly as before - checkpointing is additive.
 
     The graph covers planning, execution, and (bounded) verification/retry.
     It intentionally ends at `awaiting_approval` rather than continuing on
     into commit/push/PR - that step requires human approval and is invoked
     directly by the caller (see main.py) once the operator has reviewed the
-    diff. This keeps "propose changes" and "ship changes" as separate,
-    independently-auditable phases.
+    diff.
     """
     workflow = StateGraph(AgentState)
 
@@ -671,7 +702,7 @@ def build_refactor_graph():
     workflow.add_edge("planner", "executor")
     workflow.add_conditional_edges(
         "verifier",
-        lambda state: "retry" if state.get('overall_status') == 'verification_failed' else "end",
+        lambda state: "retry" if (state.get('overall_status') if isinstance(state, dict) else state.overall_status) == 'verification_failed' else "end",
         {
             "retry": "executor",
             "end": END,
@@ -679,4 +710,4 @@ def build_refactor_graph():
     )
     workflow.add_edge("executor", "verifier")
 
-    return workflow.compile()
+    return workflow.compile(checkpointer=checkpointer)
